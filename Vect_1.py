@@ -1,4 +1,5 @@
 import sys
+import pyqtgraph as pg
 import os
 import numpy as np
 import pygame
@@ -9,8 +10,10 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QSlider, QComboBox, QFileDialog, QPushButton, QDoubleSpinBox, QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QPointF
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QImage
+
+pg.setConfigOptions(useOpenGL=True, antialias=True)
 
 # === AUDIO ENGINE ===
 class AudioMuteMixin:
@@ -286,10 +289,11 @@ class MainWindow(QWidget, AudioMuteMixin):
 
         data = buffer[offset:offset + window_size]
         path = []
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         for point in data:
-            x = int(center_x + point[0] * x_scale)
-            y = int(center_y + point[1] * y_scale) if invert_y else int(center_y - point[1] * y_scale)
-            path.append((x, y))
+            x = float(center_x + point[0] * x_scale)
+            y = float(center_y + point[1] * y_scale if invert_y else center_y - point[1] * y_scale)
+            path.append(QPointF(x, y))
 
         trail_len = len(path)
         for i in range(1, trail_len):
@@ -300,18 +304,18 @@ class MainWindow(QWidget, AudioMuteMixin):
             pen = QPen(color)
             pen.setWidth(glow_width)
             painter.setPen(pen)
-            painter.drawLine(*path[i - 1], *path[i])
+            painter.drawLine(path[i - 1], path[i])
 
         if path:
-            x, y = path[-1]
+            last_point = path[-1]
             glow_pen = QPen(QColor.fromHsv(self.hue, 255, 255, self.glow_intensity))
             glow_pen.setWidth(6)
             painter.setPen(glow_pen)
-            painter.drawPoint(x, y)
+            painter.drawPoint(last_point)
             core_pen = QPen(QColor(255, 255, 255))
             core_pen.setWidth(1)
             painter.setPen(core_pen)
-            painter.drawPoint(x, y)
+            painter.drawPoint(last_point)
 
         painter.end()
         self.scope.setPixmap(QPixmap.fromImage(img))
