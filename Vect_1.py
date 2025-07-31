@@ -6,9 +6,20 @@ import pygame
 import time
 import tempfile
 import subprocess
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
+
+try:
+    from scipy.io import wavfile
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
-    QSlider, QComboBox, QFileDialog, QPushButton, QDoubleSpinBox, QCheckBox
+    QApplication, QWidget, QLabel, QSizePolicy, QVBoxLayout, QHBoxLayout,
+    QSlider, QComboBox, QFileDialog, QPushButton, QDoubleSpinBox, QCheckBox, QStackedWidget, QFrame, QMainWindow
 )
 from PyQt6.QtCore import Qt, QTimer, QPointF
 from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QImage
@@ -40,7 +51,7 @@ def generate_wave(wave_type, freq, amp, samplerate=44100, duration=1.0):
 
 class AudioOutput:
     def __init__(self):
-        pygame.mixer.init(frequency=44100, size=-16, channels=2)
+        pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
         self.left_freq = 440
         self.right_freq = 440
         self.left_wave = 'sine'
@@ -52,18 +63,58 @@ class AudioOutput:
         self.channel = None
         self.latest_stereo = None
         self.is_file_mode = False
+        
+        # File playback variables - much simpler approach
+        self.file_audio_data = None
+        self.file_start_time = None
+        self.file_sample_rate = 44100
+        self.file_playing = False
+        
         self.generate_continuous_buffer()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.check_update_needed)
-        self.timer.start(100)
+        self.timer.start(33)  # Back to 30fps
 
     def check_update_needed(self):
         if self.is_file_mode:
+            self.update_file_playback()
+        else:
+            current_params = (self.left_wave, self.left_freq, self.left_amp, self.right_wave, self.right_freq, self.right_amp)
+            if current_params != self.last_params:
+                self.generate_continuous_buffer()
+    
+    def update_file_playback(self):
+        """Simple file playback - just calculate position based on time"""
+        if not self.file_playing or self.file_audio_data is None:
             return
-        current_params = (self.left_wave, self.left_freq, self.left_amp, self.right_wave, self.right_freq, self.right_amp)
-        if current_params != self.last_params:
-            self.generate_continuous_buffer()
+        
+        # Initialize start time if not set
+        if self.file_start_time is None:
+            self.file_start_time = time.time()
+            
+        # Calculate where we should be in the file
+        elapsed = time.time() - self.file_start_time
+        total_duration = len(self.file_audio_data) / self.file_sample_rate
+        
+        # Loop the file
+        playback_position = elapsed % total_duration
+        sample_position = int(playback_position * self.file_sample_rate)
+        
+        # Extract a window for display - much smaller window
+        window_size = 1024
+        start_pos = sample_position
+        end_pos = start_pos + window_size
+        
+        # Handle wraparound
+        if end_pos > len(self.file_audio_data):
+            # Split across the boundary
+            part1 = self.file_audio_data[start_pos:]
+            needed = window_size - len(part1)
+            part2 = self.file_audio_data[:needed] if needed > 0 else np.empty((0, 2))
+            self.latest_stereo = np.vstack([part1, part2]) if len(part2) > 0 else part1
+        else:
+            self.latest_stereo = self.file_audio_data[start_pos:end_pos]
 
     def generate_continuous_buffer(self):
         if self.is_file_mode:
@@ -85,34 +136,125 @@ class AudioOutput:
         if self.channel:
             self.channel.stop()
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as tmp:
-            raw_path = tmp.name
+        try:
+            print(f"Loading audio file: {file_path}")
+            
+            if PYDUB_AVAILABLE:
+                # Use pydub for audio conversion
+                audio = AudioSegment.from_file(file_path)
+                
+                # Convert to stereo if mono
+                if audio.channels == 1:
+                    audio = audio.set_channels(2)
+                
+                # Convert to 44.1kHz, 16-bit
+                audio = audio.set_frame_rate(44100)
+                audio = audio.set_sample_width(2)
+                
+                # Get raw audio data and store it
+                raw_data = audio.raw_data
+                audio_array = np.frombuffer(raw_data, dtype=np.int16)
+                self.file_audio_data = audio_array.reshape(-1, 2) / 32768.0
+                self.file_sample_rate = 44100
+                
+                print(f"Audio loaded: {len(self.file_audio_data)} samples, {len(self.file_audio_data)/44100:.2f} seconds")
+                
+                # Create temporary WAV for pygame playback
+                temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                wav_path = temp_wav.name
+                temp_wav.close()
+                
+                # Export as WAV for pygame
+                audio.export(wav_path, format="wav")
+                
+            else:
+                # Fallback for WAV files
+                if not file_path.lower().endswith(('.wav', '.ogg')):
+                    raise Exception("Without pydub, only WAV and OGG files are supported")
+                
+                import wave
+                with wave.open(file_path, 'rb') as wav_file:
+                    frames = wav_file.readframes(-1)
+                    sample_rate = wav_file.getframerate()
+                    channels = wav_file.getnchannels()
+                    
+                    audio_array = np.frombuffer(frames, dtype=np.int16)
+                    
+                    if channels == 1:
+                        audio_array = np.repeat(audio_array, 2)
+                    
+                    if sample_rate != 44100:
+                        # Simple resampling
+                        resample_factor = 44100 / sample_rate
+                        new_length = int(len(audio_array) * resample_factor)
+                        indices = np.linspace(0, len(audio_array) - 1, new_length)
+                        audio_array = np.interp(indices, np.arange(len(audio_array)), audio_array).astype(np.int16)
+                    
+                    self.file_audio_data = audio_array.reshape(-1, 2) / 32768.0
+                    self.file_sample_rate = 44100
+                    wav_path = file_path
 
-        cmd = [
-            "ffmpeg", "-y", "-i", file_path,
-            "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2", "-ar", "44100", raw_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Initialize playback timing
+            self.playback_start_time = time.time()
+            self.file_position = 0
+            
+            # Start pygame playback
+            sound = pygame.mixer.Sound(wav_path)
+            self.channel = sound.play(loops=-1)  # Loop the audio
+            
+            # Initialize the display buffer
+            self.latest_stereo = self.file_audio_data[:2048].copy()
+            
+            # Clean up temporary file
+            if PYDUB_AVAILABLE and wav_path != file_path:
+                def cleanup_later():
+                    time.sleep(2)
+                    try:
+                        os.remove(wav_path)
+                    except:
+                        pass
+                import threading
+                threading.Thread(target=cleanup_later, daemon=True).start()
+                    
+        except Exception as e:
+            print(f"Error loading audio file: {e}")
+            print("Falling back to tone generator mode")
+            self.is_file_mode = False
+            self.generate_continuous_buffer()
 
-        raw_audio = np.fromfile(raw_path, dtype=np.int16)
-        os.remove(raw_path)
+class FullscreenScopeWindow(QWidget):
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.setWindowTitle("Vectorscope - Fullscreen")
+        self.setWindowFlags(Qt.WindowType.Window)
+        
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create a new scope label for fullscreen
+        self.scope = QLabel()
+        self.scope.setMinimumSize(800, 600)
+        self.scope.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self.scope)
+        
+        # Add a button to exit fullscreen
+        exit_btn = QPushButton("Exit Fullscreen (ESC)")
+        exit_btn.clicked.connect(self.close)
+        layout.addWidget(exit_btn)
+        
+        self.setLayout(layout)
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        super().keyPressEvent(event)
+    
+    def closeEvent(self, event):
+        self.main_window.exit_fullscreen()
+        event.accept()
 
-        stereo = raw_audio.reshape(-1, 2) / 32768.0
-        self.latest_stereo = stereo.copy()
-
-        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        wav_path = temp_wav.name
-        temp_wav.close()
-
-        cmd_wav = ["ffmpeg", "-y", "-i", file_path, wav_path]
-        subprocess.run(cmd_wav, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        sound = pygame.mixer.Sound(wav_path)
-        self.channel = sound.play()
-        self.file_start_time = time.time()
-        self.file_duration = len(self.latest_stereo) / 44100
-
-class MainWindow(QWidget, AudioMuteMixin):
+class MainWindow(QMainWindow, AudioMuteMixin):
     def __init__(self):
         super().__init__()
         self.audio = AudioOutput()
@@ -122,9 +264,14 @@ class MainWindow(QWidget, AudioMuteMixin):
         self.x_scale_factor = 0.45
         self.y_scale_factor = 0.45
         self.hue = 120
+        self.fullscreen_window = None
 
-        layout = QVBoxLayout()
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
 
+        # Mode selection
         mode_layout = QHBoxLayout()
         self.mode_selector = QComboBox()
         self.mode_selector.addItems(["Tone Generator", "Audio File"])
@@ -137,7 +284,10 @@ class MainWindow(QWidget, AudioMuteMixin):
         mode_layout.addWidget(self.load_button)
         layout.addLayout(mode_layout)
 
+        # Control panel
         control_panel = QHBoxLayout()
+        
+        # Left channel controls
         self.left_waveform = QComboBox()
         self.left_waveform.addItems(["sine", "square", "triangle", "sawtooth"])
         self.left_waveform.currentTextChanged.connect(lambda text: setattr(self.audio, 'left_wave', text))
@@ -160,6 +310,7 @@ class MainWindow(QWidget, AudioMuteMixin):
         control_panel.addWidget(self.left_freq_slider)
         control_panel.addWidget(self.left_freq_spin)
 
+        # Right channel controls
         self.right_waveform = QComboBox()
         self.right_waveform.addItems(["sine", "square", "triangle", "sawtooth"])
         self.right_waveform.currentTextChanged.connect(lambda text: setattr(self.audio, 'right_wave', text))
@@ -182,6 +333,7 @@ class MainWindow(QWidget, AudioMuteMixin):
         control_panel.addWidget(self.right_freq_slider)
         control_panel.addWidget(self.right_freq_spin)
 
+        # Volume controls
         self.left_vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.left_vol_slider.setRange(0, 100)
         self.left_vol_slider.setValue(int(self.audio.left_amp * 100))
@@ -196,17 +348,29 @@ class MainWindow(QWidget, AudioMuteMixin):
         control_panel.addWidget(QLabel("Right Vol"))
         control_panel.addWidget(self.right_vol_slider)
 
+        # Mute and fullscreen buttons
         self.mute_button = QPushButton("Mute")
         self.mute_button.clicked.connect(self.toggle_mute)
         control_panel.addWidget(self.mute_button)
+        
+        self.toggle_scope_btn = QPushButton("Fullscreen Scope")
+        self.toggle_scope_btn.clicked.connect(self.toggle_scope_fullscreen)
+        control_panel.addWidget(self.toggle_scope_btn)
+        
         layout.addLayout(control_panel)
 
+        # Scope section
         scope_section = QHBoxLayout()
+        
+        # Main scope display
         self.scope = QLabel()
-        self.scope.setFixedSize(512, 512)
+        self.scope.setMinimumSize(512, 512)
+        self.scope.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         scope_section.addWidget(self.scope)
 
+        # Scope controls
         scope_controls = QVBoxLayout()
+        
         self.invert_y_checkbox = QCheckBox("Invert Y")
         self.invert_y_checkbox.setChecked(False)
         scope_controls.addWidget(self.invert_y_checkbox)
@@ -242,11 +406,23 @@ class MainWindow(QWidget, AudioMuteMixin):
         scope_section.addLayout(scope_controls)
         layout.addLayout(scope_section)
 
-        self.setLayout(layout)
+        # Set up timer for scope updates
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_scope)
-        self.timer.start(33)
-        self.keyPressEvent = self.handle_key
+        self.timer.start(33)  # ~30 FPS
+
+    def toggle_scope_fullscreen(self):
+        if self.fullscreen_window is None:
+            self.fullscreen_window = FullscreenScopeWindow(self)
+            self.fullscreen_window.showMaximized()
+            self.toggle_scope_btn.setText("Exit Fullscreen Scope")
+        else:
+            self.fullscreen_window.close()
+
+    def exit_fullscreen(self):
+        if self.fullscreen_window:
+            self.fullscreen_window = None
+            self.toggle_scope_btn.setText("Fullscreen Scope")
 
     def switch_audio_mode(self, mode):
         if mode == "Audio File":
@@ -262,12 +438,17 @@ class MainWindow(QWidget, AudioMuteMixin):
         if file_path:
             self.audio.play_audio_file(file_path)
 
-    def update_scope(self):
+    def update_scope_display(self, scope_widget):
         if self.audio.latest_stereo is None:
             return
+            
         buffer = self.audio.latest_stereo
-        window_size = 2048
-        w, h = 512, 512
+        w = scope_widget.width()
+        h = scope_widget.height()
+        
+        if w <= 0 or h <= 0:
+            return
+            
         img = QImage(w, h, QImage.Format.Format_ARGB32)
         img.fill(QColor(0, 0, 0, 255))
         painter = QPainter(img)
@@ -279,33 +460,78 @@ class MainWindow(QWidget, AudioMuteMixin):
         invert_y = self.invert_y_checkbox.isChecked()
 
         if self.audio.is_file_mode:
+            # Better timing calculation for file playback
+            if hasattr(self.audio, 'channel') and self.audio.channel:
+                # Check if sound is still playing
+                if not self.audio.channel.get_busy():
+                    # Sound finished, loop back to beginning
+                    self.audio.file_start_time = time.time()
+                    if hasattr(self.audio, 'file_duration'):
+                        # Restart playback
+                        try:
+                            temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                            wav_path = temp_wav.name
+                            temp_wav.close()
+                            
+                            # Re-export from our stored audio data
+                            stereo_int = (self.audio.latest_stereo * 32767).astype(np.int16)
+                            from scipy.io import wavfile
+                            wavfile.write(wav_path, 44100, stereo_int)
+                            
+                            sound = pygame.mixer.Sound(wav_path)
+                            self.audio.channel = sound.play()
+                        except:
+                            pass
+            
             elapsed = time.time() - getattr(self.audio, 'file_start_time', 0)
-            offset = int(elapsed * 44100)
-            if offset + window_size > len(buffer):
-                offset = max(0, len(buffer) - window_size)
+            sample_offset = int(elapsed * 44100)
+            
+            # Use a smaller window for smoother display
+            window_size = 1024  # Reduced from 2048
+            
+            # Ensure we don't go past the end
+            if sample_offset + window_size > len(buffer):
+                sample_offset = max(0, len(buffer) - window_size)
+                
+            # If we're at the very end, wrap around
+            if sample_offset >= len(buffer) - window_size:
+                sample_offset = 0
+                
         else:
+            # Tone generator mode
+            window_size = 1024
             t = time.time()
-            offset = int((t * 44100) % (len(buffer) - window_size))
+            sample_offset = int((t * 44100) % (len(buffer) - window_size))
 
-        data = buffer[offset:offset + window_size]
+        # Extract the current window of audio data
+        data = buffer[sample_offset:sample_offset + window_size]
+        
+        # Skip some samples for performance (display every nth sample)
+        display_step = max(1, len(data) // 512)  # Show max 512 points
+        data = data[::display_step]
+        
         path = []
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
         for point in data:
             x = float(center_x + point[0] * x_scale)
             y = float(center_y + point[1] * y_scale if invert_y else center_y - point[1] * y_scale)
             path.append(QPointF(x, y))
 
+        # Draw the trail
         trail_len = len(path)
-        for i in range(1, trail_len):
-            age = i / trail_len
-            fade_alpha = int((1.0 - age) * self.trail_alpha)
-            glow_width = max(1, int(1 + (1 - age) * 2))
-            color = QColor.fromHsv(self.hue, 255, 255, fade_alpha)
-            pen = QPen(color)
-            pen.setWidth(glow_width)
-            painter.setPen(pen)
-            painter.drawLine(path[i - 1], path[i])
+        if trail_len > 1:
+            for i in range(1, trail_len):
+                age = i / trail_len
+                fade_alpha = int((1.0 - age) * self.trail_alpha)
+                if fade_alpha > 5:  # Only draw if visible enough
+                    glow_width = max(1, int(1 + (1 - age) * 2))
+                    color = QColor.fromHsv(self.hue, 255, 255, fade_alpha)
+                    pen = QPen(color)
+                    pen.setWidth(glow_width)
+                    painter.setPen(pen)
+                    painter.drawLine(path[i - 1], path[i])
 
+        # Draw the current point with glow
         if path:
             last_point = path[-1]
             glow_pen = QPen(QColor.fromHsv(self.hue, 255, 255, self.glow_intensity))
@@ -318,19 +544,38 @@ class MainWindow(QWidget, AudioMuteMixin):
             painter.drawPoint(last_point)
 
         painter.end()
-        self.scope.setPixmap(QPixmap.fromImage(img))
+        scope_widget.setPixmap(QPixmap.fromImage(img))
 
-    def handle_key(self, event):
+    def update_scope(self):
+        # Update main scope
+        self.update_scope_display(self.scope)
+        
+        # Update fullscreen scope if it exists
+        if self.fullscreen_window and self.fullscreen_window.isVisible():
+            self.update_scope_display(self.fullscreen_window.scope)
+
+    def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            if hasattr(self.audio, 'channel') and self.audio.channel:
-                self.audio.channel.stop()
-            self.close()
+            if self.fullscreen_window:
+                self.fullscreen_window.close()
+            else:
+                if hasattr(self.audio, 'channel') and self.audio.channel:
+                    self.audio.channel.stop()
+                self.close()
+        super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        if self.fullscreen_window:
+            self.fullscreen_window.close()
+        if hasattr(self.audio, 'channel') and self.audio.channel:
+            self.audio.channel.stop()
+        event.accept()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
     
+    window = MainWindow()
+    window.setWindowTitle("Vectorscope App")
+    window.show()
 
-
+    sys.exit(app.exec())
