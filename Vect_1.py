@@ -119,6 +119,7 @@ class AudioOutput:
     def generate_continuous_buffer(self):
         if self.is_file_mode:
             return
+        self.file_playing = False
         self.last_params = (self.left_wave, self.left_freq, self.left_amp, self.right_wave, self.right_freq, self.right_amp)
         duration = 10.0
         l = generate_wave(self.left_wave, self.left_freq, self.left_amp, duration=duration)
@@ -133,6 +134,7 @@ class AudioOutput:
 
     def play_audio_file(self, file_path):
         self.is_file_mode = True
+        self.file_playing = True
         if self.channel:
             self.channel.stop()
 
